@@ -1,0 +1,190 @@
+#!/usr/bin/env -S python3 -I
+"""Small, format-preserving editors used by the Just Say installer.
+
+  justsay-edit toml-set   FILE SECTION KEY VALUE   # VALUE is a raw TOML literal
+  justsay-edit toml-get   FILE SECTION KEY       # prints raw literal, exit 1 if absent
+  justsay-edit toml-del   FILE SECTION KEY
+  justsay-edit jsonc-add  FILE FRAGMENT            # insert marked block (idempotent)
+  justsay-edit jsonc-del  FILE                     # remove marked block
+
+Only active (uncommented) `key = value` lines inside the exact [SECTION] are
+touched; comments, ordering and unrelated keys are preserved byte-for-byte.
+"""
+import os
+import re
+import sys
+import tempfile
+
+BEGIN = "  // >>> justsay (managed by `justsay install`; removed by `justsay uninstall`)"
+END = "  // <<< justsay"
+HEADER = re.compile(r"^\s*\[{1,2}\s*([^\]]+?)\s*\]{1,2}\s*(#.*)?$")
+
+
+def atomic_write(path, text):
+    d = os.path.dirname(os.path.abspath(path))
+    mode = os.stat(path).st_mode & 0o7777 if os.path.exists(path) else 0o644
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".justsay.")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def section_bounds(lines, section):
+    start = None
+    for i, line in enumerate(lines):
+        m = HEADER.match(line)
+        if not m:
+            continue
+        if start is not None:
+            return start, i
+        if m.group(1) == section:
+            start = i
+    return (start, len(lines)) if start is not None else (None, None)
+
+
+def key_re(key):
+    return re.compile(r"^(\s*)" + re.escape(key) + r"\s*=")
+
+
+def toml_get(path, section, key):
+    lines = open(path).read().splitlines()
+    s, e = section_bounds(lines, section)
+    if s is None:
+        return 1
+    for line in lines[s + 1:e]:
+        if key_re(key).match(line):
+            print(line.split("=", 1)[1].strip())
+            return 0
+    return 1
+
+
+def toml_set(path, section, key, value):
+    text = open(path).read() if os.path.exists(path) else ""
+    lines = text.splitlines()
+    s, e = section_bounds(lines, section)
+    new = f"{key} = {value}"
+    if s is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += [f"[{section}]", new]
+    else:
+        for i in range(s + 1, e):
+            m = key_re(key).match(lines[i])
+            if m:
+                if lines[i] == m.group(1) + new:
+                    return 0
+                lines[i] = m.group(1) + new
+                break
+        else:
+            # insert after the last non-blank line of the section
+            j = e
+            while j - 1 > s and not lines[j - 1].strip():
+                j -= 1
+            lines.insert(j, new)
+    out = "\n".join(lines) + "\n"
+    if out != text:
+        atomic_write(path, out)
+    return 0
+
+
+def toml_del(path, section, key):
+    if not os.path.exists(path):
+        return 0
+    text = open(path).read()
+    lines = text.splitlines()
+    s, e = section_bounds(lines, section)
+    if s is None:
+        return 0
+    lines = lines[:s + 1] + [l for l in lines[s + 1:e] if not key_re(key).match(l)] + lines[e:]
+    # drop a section header we left empty (only whitespace until next header/EOF)
+    s2, e2 = section_bounds(lines, section)
+    if s2 is not None and not any(l.strip() for l in lines[s2 + 1:e2]):
+        del lines[s2:e2]
+        while lines and not lines[-1].strip():
+            lines.pop()
+    out = "\n".join(lines) + "\n"
+    if out != text:
+        atomic_write(path, out)
+    return 0
+
+
+def strip_jsonc(text):
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def jsonc_del(path):
+    if not os.path.exists(path):
+        return 0
+    text = open(path).read()
+    pat = re.compile(r"\n?" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?", re.S)
+    new = pat.sub("\n", text, count=1)
+    if new != text:
+        atomic_write(path, new)
+    return 0
+
+
+def jsonc_add(path, fragment_path):
+    entries = [l.rstrip().rstrip(",") for l in open(fragment_path).read().splitlines()
+               if l.strip() and not l.strip().startswith("//")]
+    jsonc_del(path)
+    text = open(path).read() if os.path.exists(path) else "{\n}\n"
+    brace = text.find("{")
+    if brace < 0 or not strip_jsonc(text).strip().startswith("{"):
+        print(f"justsay-edit: {path} is not a JSONC object; refusing to edit", file=sys.stderr)
+        return 2
+    # Other keys after our block? Then every one of our entries needs a comma.
+    rest = strip_jsonc(text[brace + 1:]).strip()
+    has_more = bool(rest) and rest != "}"
+    body = [("  " + e + ("," if (has_more or k < len(entries) - 1) else "")) for k, e in enumerate(entries)]
+    block = "\n".join([BEGIN, *body, END])
+    new = text[:brace + 1] + "\n" + block + text[brace + 1:]
+    atomic_write(path, new)
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 64
+    cmd, args = argv[1], argv[2:]
+    if cmd == "toml-set" and len(args) == 4:
+        return toml_set(*args)
+    if cmd == "toml-get" and len(args) == 3:
+        return toml_get(*args)
+    if cmd == "toml-del" and len(args) == 3:
+        return toml_del(*args)
+    if cmd == "jsonc-add" and len(args) == 2:
+        return jsonc_add(*args)
+    if cmd == "jsonc-del" and len(args) == 1:
+        return jsonc_del(*args)
+    print(__doc__, file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

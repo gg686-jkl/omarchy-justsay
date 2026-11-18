@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "justsay",
+  "name": "Just Say",
+  "version": "0.1.0",
+  "author": "Just Say contributors",
+  "license": "MIT",
+  "description": "Cloud dictation for Omarchy: Voxtype + your ChatGPT/Codex login via a local codex-asr bridge. Chinese, English and mixed speech, inserted once at the cursor.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Just Say",
+    "description": "Dictation status (ready / listening / transcribing / offline). Click to toggle, middle-click to cancel, right-click for diagnostics.",
+    "category": "Audio",
+    "aliases": ["dictation", "voxtype", "justsay"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "healthIntervalSec": 20
+    },
+    "schema": [
+      { "key": "healthIntervalSec", "type": "integer", "label": "Health check interval (seconds)", "min": 5, "max": 600, "step": 5, "defaultValue": 20 }
+    ]
+  }
+}

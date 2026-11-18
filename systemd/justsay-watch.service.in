@@ -1,0 +1,13 @@
+[Unit]
+Description=Just Say error notifier (turns Voxtype transcription failures into notifications)
+PartOf=graphical-session.target
+After=graphical-session.target voxtype.service
+
+[Service]
+Type=simple
+ExecStart=@BIN_HOME@/justsay watch
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

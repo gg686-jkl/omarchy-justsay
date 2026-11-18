@@ -1,0 +1,4 @@
+#!/bin/bash
+# omarchy:summary=Remove Just Say and restore Voxtype's local settings
+set -e
+justsay uninstall

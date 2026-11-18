@@ -1,0 +1,4 @@
+// One entry per line. Merged into ~/.config/omarchy/extensions/omarchy-menu.jsonc
+"setup.default.dictation.justsay": {"icon":"󰍬","label":"Just Say (cloud)","description":"Voxtype + ChatGPT/Codex cloud transcription","checked":"[[ \"$(omarchy-default-dictation 2>/dev/null)\" == \"justsay\" ]]","action":"omarchy-default-dictation justsay"}
+"setup.default.dictation.voxtype": {"action":"omarchy-launch-floating-terminal-with-presentation justsay switch-to-voxtype"}
+"remove.dictation.justsay": {"icon":"󰍬","label":"Just Say","when":"command -v justsay >/dev/null","action":"omarchy-launch-floating-terminal-with-presentation justsay uninstall"}

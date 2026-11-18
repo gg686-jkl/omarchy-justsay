@@ -1,0 +1,19 @@
+# Never commit secrets, personal audio, transcripts, logs or reports.
+*.env
+server.env
+auth.json
+.codex/
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.flac
+*.log
+reports/
+backups/
+state.json
+# local design notes / scratch
+Omarchy_Cloud_Dictation_Design_Spec*.md
+*.local.*
+__pycache__/
+*.pyc

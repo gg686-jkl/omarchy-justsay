@@ -1,0 +1,88 @@
+#!/usr/bin/env -S python3 -I
+"""Voxtype [output.post_process] filter for Just Say.
+
+Reads the transcript on stdin and prints the text Voxtype should insert.
+
+* Strips everything that could submit or execute: CR/LF/tab and every other
+  control character, ANSI/OSC escape sequences and bidi overrides. The output
+  is always a single line, so a terminal never sees an Enter key.
+* If no focused window can be identified, the text goes to the clipboard,
+  a notification is shown and nothing is typed (empty output plus
+  `fallback_on_empty = false` in the Voxtype config).
+* Nothing is written to disk.
+
+Environment (used by tests):
+  JUSTSAY_FOCUS_CMD   command printing the active window JSON (default: hyprctl activewindow -j)
+  JUSTSAY_CLIP_CMD    clipboard command reading stdin (default: wl-copy)
+  JUSTSAY_NOTIFY_CMD  notifier (default: notify-send)
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import unicodedata
+
+ANSI = re.compile(r"\x1b(\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|[@-Z\\-_])")
+BIDI = dict.fromkeys(map(ord, "‪‫‬‭‮⁦⁧⁨⁩‎‏"), None)
+
+
+def sanitize(text: str) -> str:
+    text = ANSI.sub("", text)
+    text = text.translate(BIDI)
+    out = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if ch in "\r\n\t\v\f  \x85":
+            out.append(" ")
+        elif cat == "Cc":  # remaining C0/C1 controls (ESC, BEL, DEL, ...)
+            continue
+        else:
+            out.append(ch)
+    return re.sub(r"[  ]{2,}", " ", "".join(out)).strip()
+
+
+def run(cmd, data=None, timeout=2):
+    try:
+        return subprocess.run(shlex.split(cmd), input=data, capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def notify(summary, body=""):
+    run(os.environ.get("JUSTSAY_NOTIFY_CMD", "notify-send -a Just\\ Say -t 4000") + " "
+        + shlex.quote(summary) + (" " + shlex.quote(body) if body else ""))
+
+
+def focused() -> bool:
+    r = run(os.environ.get("JUSTSAY_FOCUS_CMD", "hyprctl activewindow -j"))
+    if not r or r.returncode != 0:
+        return False
+    try:
+        win = json.loads(r.stdout or "{}")
+    except ValueError:
+        return False
+    return isinstance(win, dict) and bool(win.get("address")) and not win.get("hidden", False)
+
+
+def main() -> int:
+    raw = sys.stdin.read()
+    text = sanitize(raw)
+    if not text:
+        notify("Just Say", "No speech detected — nothing inserted.")
+        return 0
+    if not focused():
+        r = run(os.environ.get("JUSTSAY_CLIP_CMD", "wl-copy"), data=text)
+        if r and r.returncode == 0:
+            notify("Just Say: copied to clipboard", "No focused input found, so the text was not typed.")
+        else:
+            notify("Just Say: could not insert text", "No focused input and the clipboard is unavailable.")
+        return 0
+    sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

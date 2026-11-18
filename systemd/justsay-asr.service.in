@@ -1,0 +1,25 @@
+[Unit]
+Description=Just Say cloud ASR bridge (codex-asr, loopback only)
+Documentation=https://github.com/Wangnov/codex-asr
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/justsay/server.env
+# The local API key comes from CODEX_ASR_SERVER_KEY in the env file, never argv.
+ExecStart=@CODEX_ASR@ serve --host 127.0.0.1 --port ${JUSTSAY_PORT} --concurrency 2 --max-upload-mb 25 --request-timeout-seconds 60 --connect-timeout-seconds 10
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target

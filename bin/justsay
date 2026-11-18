@@ -1,0 +1,500 @@
+#!/bin/bash
+# Just Say — cloud dictation for Omarchy (Voxtype + codex-asr).
+# User-level only: never needs root, never touches ~/.codex/.
+set -euo pipefail
+
+JUSTSAY_VERSION="0.1.0"
+CODEX_ASR_VERSION="0.1.2"
+declare -A CODEX_ASR_SHA256=(
+  [x86_64]="16a27b87d45f91caaf9f0803cc4674a05f1f2bb5251b129426e7e502eba24f33"
+  [aarch64]="58eb101d29454924b4e395a49d7d040bd95b9ae2d37ea8a75d8890aea1d70b13"
+)
+
+# --- paths (all overridable for tests) ---------------------------------------
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+BIN_HOME="${JUSTSAY_BIN_HOME:-$HOME/.local/bin}"
+RUNTIME="${XDG_RUNTIME_DIR:-/tmp}/justsay"
+ASR_BIN=""
+APP_DIR="${JUSTSAY_APP_DIR:-$DATA_HOME/justsay}"
+STATE_DIR="$STATE_HOME/justsay"
+STATE_FILE="$STATE_DIR/state.json"
+ENV_DIR="$CONFIG_HOME/justsay"
+ENV_FILE="$ENV_DIR/server.env"
+UNIT_DIR="$CONFIG_HOME/systemd/user"
+UNIT="justsay-asr.service"
+WATCH_UNIT="justsay-watch.service"
+VOX_CONFIG="${JUSTSAY_VOXTYPE_CONFIG:-$CONFIG_HOME/voxtype/config.toml}"
+VOX_DROPIN="$UNIT_DIR/voxtype.service.d/justsay.conf"
+MENU_FILE="$CONFIG_HOME/omarchy/extensions/omarchy-menu.jsonc"
+PLUGIN_DIR="$CONFIG_HOME/omarchy/plugins/justsay"
+CODEX_AUTH="${CODEX_HOME:-$HOME/.codex}/auth.json"
+SYSTEMCTL="${JUSTSAY_SYSTEMCTL:-systemctl --user}"
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SRC_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+EDIT="$SRC_DIR/bin/justsay-edit"
+
+# Keys Just Say sets in Voxtype's config.toml: "section|key|value".
+vox_settings() {
+  local port=$1
+  cat <<EOF
+whisper|mode|"remote"
+whisper|remote_endpoint|"http://127.0.0.1:$port"
+whisper|remote_timeout_secs|30
+whisper|language|"auto"
+whisper|remote_send_auto_language|false
+output|fallback_to_clipboard|true
+output|auto_submit|false
+text|smart_auto_submit|false
+output.post_process|command|"$BIN_HOME/justsay-postprocess"
+output.post_process|timeout_ms|3000
+output.post_process|fallback_on_empty|false
+EOF
+}
+
+# --- helpers -----------------------------------------------------------------
+say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31mjustsay:\033[0m %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+sysd() { $SYSTEMCTL "$@"; }
+
+notify() { # urgency summary body
+  if have notify-send; then notify-send -a "Just Say" -u "$1" -t 6000 "$2" "${3:-}" >/dev/null 2>&1 || true; fi
+}
+
+env_get() { [[ -r $ENV_FILE ]] && sed -n "s/^$1=//p" "$ENV_FILE" | head -1; }
+port() { local p; p=$(env_get JUSTSAY_PORT 2>/dev/null || true); echo "${p:-8788}"; }
+
+state_get() { [[ -f $STATE_FILE ]] && jq -r "$1 // empty" "$STATE_FILE"; }
+state_put() { # jq-filter [args...]
+  mkdir -p "$STATE_DIR"
+  local f=$1; shift
+  local cur='{}'; [[ -f $STATE_FILE ]] && cur=$(cat "$STATE_FILE")
+  jq "$@" "$f" <<<"$cur" >"$STATE_FILE.tmp" && mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# Decide whether the Codex login looks usable without printing any secret.
+# Prints: ok | missing | expired | unreadable
+auth_state() {
+  [[ -f $CODEX_AUTH ]] || { echo missing; return; }
+  [[ -r $CODEX_AUTH ]] || { echo unreadable; return; }
+  local exp
+  exp=$(jq -r '.tokens.access_token // empty' "$CODEX_AUTH" 2>/dev/null |
+    cut -d. -f2 | tr '_-' '/+' | { read -r s; while (( ${#s} % 4 )); do s+="="; done; printf '%s' "$s"; } |
+    base64 -d 2>/dev/null | jq -r '.exp // empty' 2>/dev/null) || true
+  if [[ -z $exp ]]; then
+    # API-key logins or unknown token formats: let the server decide.
+    jq -e '.tokens.access_token // .OPENAI_API_KEY' "$CODEX_AUTH" >/dev/null 2>&1 && echo ok || echo missing
+  elif (( exp < $(date +%s) + 30 )); then
+    echo expired
+  else
+    echo ok
+  fi
+}
+
+online() { [[ -n $(ip -o route show default 2>/dev/null) || -n $(ip -o -6 route show default 2>/dev/null) ]]; }
+
+healthz() { curl -fsS -m "${1:-1}" "http://127.0.0.1:$(port)/healthz" >/dev/null 2>&1; }
+
+# One-line health verdict for the widget/preflight: "<status>\t<detail>"
+health_line() {
+  if ! have voxtype; then printf 'service\tVoxtype is not installed\n'; return; fi
+  if ! sysd is-active --quiet voxtype.service 2>/dev/null; then printf 'service\tVoxtype daemon is not running\n'; return; fi
+  if ! sysd is-active --quiet "$UNIT" 2>/dev/null || ! healthz 1; then printf 'service\tcloud bridge (justsay-asr) is not running\n'; return; fi
+  case $(auth_state) in
+    ok) ;;
+    expired) printf 'login\tChatGPT/Codex login expired — run: codex login\n'; return ;;
+    *) printf 'login\tNo ChatGPT/Codex login — run: codex login\n'; return ;;
+  esac
+  if ! online; then printf 'offline\tNo network connection\n'; return; fi
+  printf 'ok\tready\n'
+}
+
+# --- commands ----------------------------------------------------------------
+cmd_health() {
+  local line status detail
+  line=$(health_line); status=${line%%$'\t'*}; detail=${line#*$'\t'}
+  if [[ ${1:-} == --json ]]; then
+    local le="" ts msg
+    if [[ -f $RUNTIME/last-error ]]; then
+      IFS=$'\t' read -r ts msg <"$RUNTIME/last-error" || true
+      (( ${ts:-0} > $(date +%s) - 300 )) && le=$msg
+    fi
+    jq -nc --arg s "$status" --arg d "$detail" --arg e "$le" '{status:$s, detail:$d, lastError:$e}'
+  else
+    echo "$status: $detail"
+  fi
+  [[ $status == ok ]]
+}
+
+cmd_preflight() {
+  local line status detail
+  line=$(health_line); status=${line%%$'\t'*}; detail=${line#*$'\t'}
+  [[ $status == ok ]] && return 0
+  [[ ${1:-} == --notify ]] && notify critical "Just Say: not recording" "$detail"
+  echo "$detail" >&2
+  return 1
+}
+
+install_files() {
+  say "Installing Just Say $JUSTSAY_VERSION files"
+  mkdir -p "$APP_DIR/bin" "$APP_DIR/systemd" "$APP_DIR/menu" "$BIN_HOME"
+  if [[ $SRC_DIR != "$APP_DIR" ]]; then
+    install -m 755 "$SRC_DIR"/bin/justsay "$SRC_DIR"/bin/justsay-edit "$SRC_DIR"/bin/justsay-postprocess \
+      "$SRC_DIR"/bin/omarchy-dictation-justsay "$SRC_DIR"/bin/omarchy-install-dictation-justsay \
+      "$SRC_DIR"/bin/omarchy-remove-dictation-justsay "$APP_DIR/bin/"
+    install -m 644 "$SRC_DIR"/systemd/* "$APP_DIR/systemd/"
+    install -m 644 "$SRC_DIR"/menu/* "$APP_DIR/menu/"
+  fi
+  local f
+  for f in justsay justsay-postprocess omarchy-dictation-justsay omarchy-install-dictation-justsay omarchy-remove-dictation-justsay; do
+    if [[ -e $BIN_HOME/$f && ! -L $BIN_HOME/$f ]]; then
+      die "$BIN_HOME/$f exists and is not ours; refusing to overwrite"
+    fi
+    ln -sfn "$APP_DIR/bin/$f" "$BIN_HOME/$f"
+  done
+  ok "commands linked into $BIN_HOME"
+
+  # Bar widget: when installed from a plain clone, give Omarchy a plugin copy.
+  if [[ -f $SRC_DIR/manifest.json && $SRC_DIR != "$PLUGIN_DIR" ]] && have omarchy-plugin-list &&
+     [[ ! -e $PLUGIN_DIR || $(state_get '.plugin_copied') == true ]]; then
+    mkdir -p "$PLUGIN_DIR"
+    cp -r "$SRC_DIR/manifest.json" "$SRC_DIR/Widget.qml" "$PLUGIN_DIR/"
+    [[ -d $SRC_DIR/assets ]] && cp -r "$SRC_DIR/assets" "$PLUGIN_DIR/"
+    state_put '.plugin_copied=true'
+    ok "bar widget copied to $PLUGIN_DIR"
+  fi
+}
+
+find_codex_asr() {
+  local c
+  for c in "$APP_DIR/bin/codex-asr" "$(command -v codex-asr 2>/dev/null || true)"; do
+    [[ -n $c && -x $c ]] || continue
+    if "$c" --version 2>/dev/null | grep -q "codex-asr $CODEX_ASR_VERSION"; then echo "$c"; return 0; fi
+  done
+  return 1
+}
+
+install_codex_asr() {
+  say "codex-asr $CODEX_ASR_VERSION"
+  local bin
+  if bin=$(find_codex_asr); then ok "already installed: $bin"; ASR_BIN=$bin; return; fi
+  local arch; arch=$(uname -m)
+  [[ -n ${CODEX_ASR_SHA256[$arch]:-} ]] || die "no pinned codex-asr build for $arch; install codex-asr $CODEX_ASR_VERSION yourself and rerun"
+  local name="codex-asr-$arch-unknown-linux-gnu"
+  local url="https://github.com/Wangnov/codex-asr/releases/download/v$CODEX_ASR_VERSION/$name.tar.xz"
+  local tmp; tmp=$(mktemp -d)
+  if ! curl -fsSL --proto '=https' -o "$tmp/a.tar.xz" "$url"; then rm -rf "$tmp"; die "download failed: $url"; fi
+  if ! echo "${CODEX_ASR_SHA256[$arch]}  $tmp/a.tar.xz" | sha256sum -c --quiet -; then
+    rm -rf "$tmp"; die "checksum mismatch for codex-asr; not installing"
+  fi
+  tar -xJf "$tmp/a.tar.xz" -C "$tmp"
+  install -m 755 "$tmp/$name/codex-asr" "$APP_DIR/bin/codex-asr"
+  install -m 644 "$tmp/$name/LICENSE-MIT" "$APP_DIR/codex-asr.LICENSE"
+  rm -rf "$tmp"
+  ok "installed $APP_DIR/bin/codex-asr (sha256 verified)"
+  ASR_BIN="$APP_DIR/bin/codex-asr"
+}
+
+pick_port() {
+  local p
+  p=$(env_get JUSTSAY_PORT 2>/dev/null || true)
+  [[ -n $p ]] && { echo "$p"; return; }
+  for p in $(seq 8788 8798); do
+    ss -Hltn "sport = :$p" 2>/dev/null | grep -q . || { echo "$p"; return; }
+  done
+  die "no free loopback port in 8788-8798"
+}
+
+install_service() {
+  say "Cloud bridge service ($UNIT)"
+  mkdir -p "$ENV_DIR" "$UNIT_DIR/voxtype.service.d"
+  chmod 700 "$ENV_DIR"
+  if [[ ! -s $ENV_FILE ]]; then
+    local key port; key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'); port=$(pick_port)
+    (umask 077; printf 'JUSTSAY_PORT=%s\nCODEX_ASR_SERVER_KEY=%s\nVOXTYPE_WHISPER_API_KEY=%s\n' "$port" "$key" "$key" >"$ENV_FILE")
+    ok "generated loopback key in $ENV_FILE (0600)"
+  else
+    chmod 600 "$ENV_FILE"; ok "reusing $ENV_FILE"
+  fi
+  [[ -n ${ASR_BIN:-} ]] || ASR_BIN=$(find_codex_asr) || die "codex-asr not found"
+  sed "s#@CODEX_ASR@#$ASR_BIN#" "$APP_DIR/systemd/justsay-asr.service.in" >"$UNIT_DIR/$UNIT.tmp"
+  mv -f "$UNIT_DIR/$UNIT.tmp" "$UNIT_DIR/$UNIT"
+  sed "s#@BIN_HOME@#$BIN_HOME#" "$APP_DIR/systemd/justsay-watch.service.in" >"$UNIT_DIR/$WATCH_UNIT"
+  sysd daemon-reload
+  sysd enable --now "$WATCH_UNIT" >/dev/null 2>&1 || warn "could not start $WATCH_UNIT"
+  sysd enable --now "$UNIT" >/dev/null 2>&1 || sysd enable --now "$UNIT"
+  sysd restart "$UNIT"
+  local _i; for _i in $(seq 1 30); do healthz 1 && break; sleep 0.2; done
+  healthz 1 && ok "listening on 127.0.0.1:$(port)" || die "$UNIT did not become healthy; see: journalctl --user -u $UNIT"
+}
+
+backup() {
+  local ts dir; ts=$(date +%Y%m%d-%H%M%S); dir="$STATE_DIR/backups/$ts"
+  mkdir -p "$dir"
+  [[ -f $VOX_CONFIG ]] && cp -p "$VOX_CONFIG" "$dir/voxtype-config.toml"
+  [[ -f $MENU_FILE ]] && cp -p "$MENU_FILE" "$dir/omarchy-menu.jsonc"
+  local d="$CONFIG_HOME/omarchy/defaults/dictation"; [[ -f $d ]] && cp -p "$d" "$dir/dictation"
+  echo "$dir"
+}
+
+cmd_activate() {
+  say "Switching Voxtype to cloud transcription"
+  [[ -f $VOX_CONFIG ]] || die "Voxtype config not found at $VOX_CONFIG (run Omarchy's Voxtype setup first)"
+  if [[ $(state_get '.active') != true ]]; then
+    local dir; dir=$(backup)
+    state_put '.backup=$b' --arg b "$dir"
+    # Remember each original value so deactivate restores only what we changed.
+    local orig='{}' sec key val cur
+    while IFS='|' read -r sec key val; do
+      if cur=$("$EDIT" toml-get "$VOX_CONFIG" "$sec" "$key"); then
+        orig=$(jq --arg k "$sec|$key" --arg v "$cur" '.[$k]=$v' <<<"$orig")
+      else
+        orig=$(jq --arg k "$sec|$key" '.[$k]=null' <<<"$orig")
+      fi
+    done < <(vox_settings "$(port)")
+    state_put '.original=$o' --argjson o "$orig"
+    ok "backup: $dir"
+  fi
+  while IFS='|' read -r sec key val; do
+    "$EDIT" toml-set "$VOX_CONFIG" "$sec" "$key" "$val"
+  done < <(vox_settings "$(port)")
+  mkdir -p "$(dirname "$VOX_DROPIN")"
+  install -m 644 "$APP_DIR/systemd/voxtype-justsay.conf" "$VOX_DROPIN"
+  state_put '.active=true'
+  ok "Voxtype → http://127.0.0.1:$(port) (language auto, no auto-submit, sanitized output, transcripts kept out of logs)"
+  sysd daemon-reload
+  sysd restart voxtype.service
+  ok "voxtype.service restarted"
+}
+
+cmd_deactivate() {
+  [[ $(state_get '.active') == true ]] || { ok "Voxtype is not in Just Say mode"; return 0; }
+  say "Restoring Voxtype's previous (local) settings"
+  local k sec key v
+  while IFS=$'\t' read -r k v; do
+    sec=${k%%|*}; key=${k#*|}
+    if [[ $v == "null" ]]; then "$EDIT" toml-del "$VOX_CONFIG" "$sec" "$key"
+    else "$EDIT" toml-set "$VOX_CONFIG" "$sec" "$key" "$v"; fi
+  done < <(jq -r '.original | to_entries[] | [.key, (if .value == null then "null" else .value end)] | @tsv' "$STATE_FILE")
+  rm -f "$VOX_DROPIN"; rmdir "$(dirname "$VOX_DROPIN")" 2>/dev/null || true
+  sysd daemon-reload || true
+  state_put '.active=false'
+  ok "restored the keys Just Say had changed in $VOX_CONFIG"
+  sysd restart voxtype.service >/dev/null 2>&1 || true
+  local model; model=$("$EDIT" toml-get "$VOX_CONFIG" whisper model 2>/dev/null | tr -d '"' || true)
+  if [[ -n $model && ! -e $DATA_HOME/voxtype/models/ggml-$model.bin ]] && ! sysd is-active --quiet "$UNIT"; then
+    warn "local model '$model' is not on disk; Voxtype needs: voxtype setup --download"
+  fi
+}
+
+register_omarchy() {
+  say "Registering with Omarchy"
+  mkdir -p "$(dirname "$MENU_FILE")"
+  "$EDIT" jsonc-add "$MENU_FILE" "$APP_DIR/menu/justsay.jsonc"
+  ok "menu: Setup › Defaults › Dictation › Just Say (cloud)"
+  if have omarchy-dictation-use; then
+    omarchy-dictation-use justsay && ok "default dictation backend: justsay"
+  fi
+  have omarchy-restart-hyprctl && omarchy-restart-hyprctl >/dev/null 2>&1 || true
+  have omarchy-menu && omarchy-menu refresh >/dev/null 2>&1 || true
+}
+
+cmd_install() {
+  have voxtype || die "Voxtype is not installed. Install it first: Omarchy menu › Install › AI › Dictation › Voxtype"
+  for t in jq curl python3 sha256sum; do have $t || die "missing dependency: $t"; done
+  mkdir -p "$STATE_DIR"
+  install_files
+  EDIT="$APP_DIR/bin/justsay-edit"
+  install_codex_asr
+  install_service
+  cmd_activate
+  register_omarchy
+  [[ $(auth_state) == ok ]] || warn "ChatGPT/Codex login missing or expired — run: codex login"
+  state_put '.installed=true | .version=$v' --arg v "$JUSTSAY_VERSION"
+  say "Done. Press Alt+Space (toggle) or hold Right Alt (push-to-talk) to dictate."
+  echo "    Optional bar widget: omarchy plugin enable justsay"
+  have omarchy-notification-send && omarchy-notification-send -g "Just Say is ready" "Alt+Space to dictate (cloud)" -t 8000 >/dev/null 2>&1 || true
+}
+
+cmd_switch_to_voxtype() {
+  cmd_deactivate
+  if have omarchy-default-dictation; then
+    exec omarchy-install-dictation-voxtype
+  fi
+}
+
+cmd_uninstall() {
+  say "Uninstalling Just Say"
+  [[ -f $STATE_FILE ]] && cmd_deactivate
+  sysd disable --now "$UNIT" "$WATCH_UNIT" >/dev/null 2>&1 || true
+  rm -f "$UNIT_DIR/$UNIT" "$UNIT_DIR/$WATCH_UNIT" "$VOX_DROPIN"
+  rmdir "$UNIT_DIR/voxtype.service.d" 2>/dev/null || true
+  sysd daemon-reload || true
+  ok "removed $UNIT, $WATCH_UNIT and the Voxtype drop-in"
+  rm -f "$ENV_FILE"; rmdir "$ENV_DIR" 2>/dev/null || true
+  [[ -f $MENU_FILE ]] && "$EDIT" jsonc-del "$MENU_FILE" && ok "menu entries removed"
+  local d="$CONFIG_HOME/omarchy/defaults/dictation"
+  if [[ -f $d && $(<"$d") == justsay ]]; then
+    printf 'voxtype\n' >"$d"; ok "default dictation backend: voxtype"
+  fi
+  sysd restart voxtype.service >/dev/null 2>&1 || true
+  have omarchy-plugin-disable && omarchy-plugin-disable justsay >/dev/null 2>&1 || true
+  if [[ $(state_get '.plugin_copied') == true ]]; then
+    rm -f "$PLUGIN_DIR/manifest.json" "$PLUGIN_DIR/Widget.qml"; rm -rf "$PLUGIN_DIR/assets"; rmdir "$PLUGIN_DIR" 2>/dev/null || true
+  fi
+  local f
+  for f in justsay justsay-postprocess omarchy-dictation-justsay omarchy-install-dictation-justsay omarchy-remove-dictation-justsay; do
+    [[ -L $BIN_HOME/$f ]] && rm -f "$BIN_HOME/$f"
+  done
+  [[ -d $APP_DIR && $APP_DIR == */justsay ]] && rm -rf -- "$APP_DIR"
+  have omarchy-restart-hyprctl && omarchy-restart-hyprctl >/dev/null 2>&1 || true
+  ok "Just Say removed. Backups and reports kept in $STATE_DIR"
+  echo "    Voxtype is back on local transcription. If its model was cleaned up: voxtype setup --download"
+}
+
+cmd_rollback() {
+  local dir; dir=$(state_get '.backup')
+  [[ -n $dir && -d $dir ]] || die "no backup recorded"
+  say "Restoring files from $dir"
+  [[ -f $dir/voxtype-config.toml ]] && cp -p "$dir/voxtype-config.toml" "$VOX_CONFIG" && ok "$VOX_CONFIG"
+  [[ -f $dir/omarchy-menu.jsonc ]] && cp -p "$dir/omarchy-menu.jsonc" "$MENU_FILE" && ok "$MENU_FILE"
+  [[ -f $dir/dictation ]] && cp -p "$dir/dictation" "$CONFIG_HOME/omarchy/defaults/dictation" && ok "dictation default"
+  rm -f "$VOX_DROPIN"; rmdir "$(dirname "$VOX_DROPIN")" 2>/dev/null || true
+  sysd daemon-reload || true
+  state_put '.active=false'
+  sysd restart voxtype.service >/dev/null 2>&1 || true
+  ok "Voxtype is on its original settings. Re-enable cloud mode with: justsay activate"
+}
+
+cmd_status() {
+  printf 'Just Say %s\n' "$JUSTSAY_VERSION"
+  printf '  backend:     %s\n' "$(omarchy-default-dictation 2>/dev/null || echo '?')"
+  printf '  cloud mode:  %s\n' "$([[ $(state_get '.active') == true ]] && echo on || echo off)"
+  printf '  voxtype:     %s (%s)\n' "$(voxtype status 2>/dev/null || echo '?')" "$(sysd is-active voxtype.service 2>/dev/null || true)"
+  printf '  bridge:      %s on 127.0.0.1:%s\n' "$(sysd is-active "$UNIT" 2>/dev/null || true)" "$(port)"
+  printf '  login:       %s\n' "$(auth_state)"
+  printf '  health:      %s\n' "$(cmd_health || true)"
+}
+
+cmd_doctor() {
+  cmd_status
+  echo
+  say "Checks"
+  local engine; engine=$("$EDIT" toml-get "$VOX_CONFIG" whisper mode 2>/dev/null || echo '(local default)')
+  [[ $engine == '"remote"' ]] && ok "Voxtype whisper mode: remote" || warn "Voxtype whisper mode: $engine"
+  [[ $("$EDIT" toml-get "$VOX_CONFIG" output auto_submit 2>/dev/null) == false ]] && ok "auto_submit disabled" || warn "auto_submit not disabled"
+  [[ $(stat -c %a "$ENV_FILE" 2>/dev/null) == 600 ]] && ok "key file is 0600" || warn "key file missing or not 0600"
+  ss -Hltn 2>/dev/null | awk '{print $4}' | grep -E ":$(port)\$" | grep -qv '^127\.0\.0\.1:' && warn "port $(port) is bound beyond loopback!" || ok "bridge bound to loopback only"
+  if healthz 1; then
+    local code; code=$(printf 'RIFF' | curl -s -o /dev/null -w '%{http_code}' -m 3 -F 'file=@-;filename=probe.wav' "http://127.0.0.1:$(port)/v1/audio/transcriptions")
+    [[ $code == 401 ]] && ok "unauthenticated requests are rejected (HTTP 401)" || warn "unauthenticated request returned HTTP $code"
+  fi
+  echo
+  echo "Logs: journalctl --user -u $UNIT -u voxtype -n 50"
+  if [[ -t 0 ]]; then read -rsn1 -p "Press any key to close…"; echo; fi
+}
+
+# Map a Voxtype error line to a short, actionable message (no transcript text).
+error_message() {
+  local l=$1
+  case $l in
+    *"Connection refused"*|*"Connect error"*) echo "The local cloud bridge is not reachable. If it crashed it restarts by itself; otherwise run: justsay doctor" ;;
+    *"authentication token"*|*"sign"*"in again"*|*"HTTP 401"*|*"returned 403"*) echo "ChatGPT/Codex login expired or was rejected. Run: codex login" ;;
+    *"returned 401"*) echo "Voxtype and the bridge disagree on the local key. Run: justsay install" ;;
+    *"429"*|*"rate"*"limit"*) echo "The cloud service is rate-limiting requests. Wait a bit and try again." ;;
+    *"timed out"*|*"Timeout"*|*"timeout"*) echo "Cloud transcription timed out (slow or no network)." ;;
+    *"502"*|*"upstream"*|*"dns"*|*"Network"*) echo "Cloud transcription failed: offline, or the unofficial service is unavailable." ;;
+    *) echo "Transcription failed. Run: justsay doctor" ;;
+  esac
+}
+
+cmd_watch() {
+  mkdir -p "$RUNTIME"; chmod 700 "$RUNTIME"
+  journalctl --user -u voxtype.service -f -n 0 -o cat 2>/dev/null | while IFS= read -r line; do
+    [[ $line == *"Transcription failed"* || $line == *"transcription failed"* ]] || continue
+    local msg; msg=$(error_message "$line")
+    printf '%s\t%s\n' "$(date +%s)" "$msg" >"$RUNTIME/last-error"
+    notify critical "Just Say: nothing was inserted" "$msg"
+  done
+}
+
+# Dry-run inventory / removal of Voxtype's local Whisper models. Only regular
+# files named ggml-*.bin directly inside Voxtype's own models directory are
+# candidates, and only while cloud mode is active and verified healthy.
+cmd_cleanup() {
+  local mode=${1:---dry-run}
+  local dir="$DATA_HOME/voxtype/models" report_dir="$STATE_DIR/reports"
+  mkdir -p "$report_dir"
+  local report; report="$report_dir/cleanup-$(date +%Y%m%d-%H%M%S).txt"
+  local -a cand=()
+  local f
+  if [[ -d $dir && ! -L $dir ]]; then
+    while IFS= read -r -d '' f; do cand+=("$f"); done < <(find "$dir" -maxdepth 1 -type f -name 'ggml-*.bin' -user "$(id -u)" -print0 | sort -z)
+  fi
+  {
+    echo "Just Say cleanup report ($mode) — $(date -Is)"
+    echo "Scope: regular files $dir/ggml-*.bin owned by $(id -un); nothing else is touched."
+    echo "Kept: Voxtype config, CACHEDIR.TAG, other engines' models, ~/.codex/, shared caches."
+    echo
+    local total=0 sz
+    for f in "${cand[@]}"; do
+      sz=$(stat -c %s "$f"); total=$((total + sz))
+      printf '%12s  %s  %s\n' "$(numfmt --to=iec "$sz")" "$(stat -c '%U:%G %a' "$f")" "$f"
+    done
+    (( ${#cand[@]} )) || echo "(no candidates)"
+    echo
+    echo "Expected savings: $(numfmt --to=iec $total)"
+    echo "Restore later with: voxtype setup --download"
+  } | tee "$report"
+  [[ $mode == --apply ]] || { echo; echo "Dry run only. Report: $report"; return 0; }
+
+  [[ $(state_get '.active') == true ]] || die "cloud mode is not active; refusing to delete local models"
+  cmd_preflight >/dev/null || die "cloud transcription is not healthy; refusing to delete local models"
+  (( ${#cand[@]} )) || return 0
+  if [[ -t 0 ]]; then read -rp "Delete the ${#cand[@]} file(s) listed above? [y/N] " a; [[ $a == [yY] ]] || die "aborted"; fi
+  local before after; before=$(df -B1 --output=avail "$dir" | tail -1)
+  for f in "${cand[@]}"; do rm -f -- "$f" && echo "deleted $f" | tee -a "$report"; done
+  after=$(df -B1 --output=avail "$dir" | tail -1)
+  echo "Free space: $(numfmt --to=iec "$before") → $(numfmt --to=iec "$after")" | tee -a "$report"
+  echo "Report: $report"
+}
+
+usage() {
+  cat <<EOF
+Just Say $JUSTSAY_VERSION — cloud dictation for Omarchy
+
+Usage: justsay <command>
+  install              Install/repair (idempotent): codex-asr bridge, Voxtype cloud mode, Omarchy menu + backend
+  status | doctor      Show state / run diagnostics
+  health [--json]      One-line readiness check (used by the bar widget)
+  activate|deactivate  Switch Voxtype between cloud (Just Say) and its previous local settings
+  switch-to-voxtype    Deactivate and hand back to Omarchy's own Voxtype backend
+  cleanup [--dry-run|--apply]
+                       Inventory / remove Voxtype's local Whisper model files (dry run by default)
+  rollback             Restore the config files exactly as they were before the first install
+  uninstall            Remove everything Just Say added (keeps backups and reports)
+EOF
+}
+
+case "${1:-}" in
+  install) cmd_install ;;
+  activate) cmd_activate ;;
+  deactivate) cmd_deactivate ;;
+  switch-to-voxtype) cmd_switch_to_voxtype ;;
+  uninstall) cmd_uninstall ;;
+  rollback) cmd_rollback ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  health) shift; cmd_health "$@" ;;
+  preflight) shift; cmd_preflight "$@" ;;
+  cleanup) shift; cmd_cleanup "$@" ;;
+  watch) cmd_watch ;;
+  version|--version|-V) echo "justsay $JUSTSAY_VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage >&2; exit 64 ;;
+esac

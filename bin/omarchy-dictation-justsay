@@ -1,0 +1,50 @@
+#!/bin/bash
+# omarchy:summary=Record dictation using Just Say (Voxtype + cloud ASR)
+# omarchy:args=<start|stop|toggle|cancel>
+#
+# Called by `omarchy-dictation` (Alt+Space toggle, Right Alt push-to-talk).
+# Refuses to start when the cloud path is not ready, never starts a second
+# session, and never re-triggers while a transcription is in flight.
+set -uo pipefail
+
+action=${1:-}
+case $action in start|stop|toggle|cancel) ;; *)
+  echo "Usage: omarchy dictation justsay <start|stop|toggle|cancel>" >&2; exit 1 ;;
+esac
+
+command -v voxtype >/dev/null || { echo "Voxtype is not installed" >&2; exit 1; }
+
+lockdir="${XDG_RUNTIME_DIR:-/tmp}/justsay"
+mkdir -p "$lockdir" && chmod 700 "$lockdir"
+exec 8>"$lockdir/adapter.lock"
+flock -w 2 8 || exit 0   # a press is already being handled
+
+notify() { command -v notify-send >/dev/null && notify-send -a "Just Say" -u "$1" -t 4000 "$2" "${3:-}" >/dev/null 2>&1 || true; }
+
+state=$(voxtype status 2>/dev/null || echo stopped)
+
+begin() {
+  justsay preflight --notify >/dev/null 2>&1 || exit 1
+  voxtype record start
+}
+
+case $action in
+  start)
+    case $state in
+      idle) begin ;;
+      transcribing) notify low "Just Say" "Still transcribing the previous recording…" ;;
+      *) : ;;   # already recording: ignore repeated key-down
+    esac ;;
+  toggle)
+    case $state in
+      idle) begin ;;
+      recording|streaming) voxtype record stop ;;
+      transcribing) notify low "Just Say" "Still transcribing the previous recording…" ;;
+      *) notify critical "Just Say" "Voxtype daemon is not running (systemctl --user start voxtype)"; exit 1 ;;
+    esac ;;
+  stop)
+    [[ $state == recording || $state == streaming ]] && voxtype record stop
+    exit 0 ;;
+  cancel)
+    [[ $state == idle || $state == stopped ]] || voxtype record cancel ;;
+esac

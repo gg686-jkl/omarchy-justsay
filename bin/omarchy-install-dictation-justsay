@@ -1,0 +1,4 @@
+#!/bin/bash
+# omarchy:summary=Install and configure Just Say cloud dictation
+set -e
+justsay install
