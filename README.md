@@ -42,6 +42,31 @@ Or from a clone:
 git clone https://github.com/gg686-jkl/omarchy-justsay.git && cd omarchy-justsay && ./install.sh
 ```
 
+### Or let your AI agent do it
+
+Paste this into Claude Code, Codex or any terminal agent running on your Omarchy machine:
+
+```text
+Set up Just Say cloud dictation (https://github.com/gg686-jkl/omarchy-justsay) on this Omarchy machine.
+
+1. Check prerequisites: Omarchy 4.x (`omarchy-default-dictation` exists), Voxtype installed and
+   `systemctl --user is-active voxtype` is active, and a Codex login (`~/.codex/auth.json` exists).
+   If Voxtype is missing, tell me to install it from Omarchy menu › Install › AI › Dictation › Voxtype.
+   If the login is missing, tell me to run `codex login`, then stop and wait for me.
+   Never read, print or copy the contents of ~/.codex/.
+2. Install: `omarchy plugin add https://github.com/gg686-jkl/omarchy-justsay.git --yes`
+   (if it already exists, run `omarchy plugin update justsay`), then run
+   `~/.config/omarchy/plugins/justsay/install.sh`.
+3. Verify: `justsay health` must print `ok: ready`. Run `justsay doctor </dev/null` and report any
+   line marked "!". If something fails, read `journalctl --user -u justsay-asr -u voxtype -n 50`
+   and fix it, then run install.sh again (it's idempotent).
+4. Ask me whether to enable the bar widget (`omarchy plugin enable justsay`).
+5. Ask me to press Alt+Space, say a sentence, press Alt+Space again, and confirm the text appeared.
+6. Only after I confirm dictation works, show me `justsay cleanup` (a dry run) and ask before running
+   `justsay cleanup --apply` to delete the unused local Whisper model.
+Don't use sudo, don't edit Hyprland bindings, and don't touch anything outside what Just Say's installer manages.
+```
+
 The installer is idempotent: running it again repairs the setup and never duplicates anything. It works entirely as your user, with no root:
 
 1. Backs up `~/.config/voxtype/config.toml`, the Omarchy menu extension file and the dictation default to `~/.local/state/justsay/backups/`.
