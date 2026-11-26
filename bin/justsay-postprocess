@@ -15,6 +15,7 @@ Environment (used by tests):
   JUSTSAY_FOCUS_CMD   command printing the active window JSON (default: hyprctl activewindow -j)
   JUSTSAY_CLIP_CMD    clipboard command reading stdin (default: wl-copy)
   JUSTSAY_NOTIFY_CMD  notifier (default: notify-send)
+  JUSTSAY_DICT_FILE   path to optional custom dictionary JSON (default: ~/.config/justsay/dictionary.json)
 """
 import json
 import os
@@ -67,9 +68,65 @@ def focused() -> bool:
     return isinstance(win, dict) and bool(win.get("address")) and not win.get("hidden", False)
 
 
+def default_dict_path() -> str:
+    env_path = os.environ.get("JUSTSAY_DICT_FILE")
+    if env_path is not None:
+        return env_path
+    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(cfg, "justsay", "dictionary.json")
+
+
+def apply_dictionary(text: str) -> str:
+    path = default_dict_path()
+    if not path or not os.path.isfile(path):
+        return text
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return text
+    if not isinstance(data, dict):
+        return text
+
+    replacements = data.get("replacements")
+    if isinstance(replacements, dict):
+        items = [
+            (str(k), str(v))
+            for k, v in replacements.items()
+            if isinstance(k, str) and k and isinstance(v, str)
+        ]
+        # Longer keys first so multi-word phrases win over shorter sub-terms.
+        items.sort(key=lambda kv: len(kv[0]), reverse=True)
+        for src, dst in items:
+            if src.isascii():
+                pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(src) + r"(?![A-Za-z0-9_])", re.IGNORECASE)
+            else:
+                pat = re.compile(re.escape(src), re.IGNORECASE)
+            text = pat.sub(lambda _m, r=dst: r, text)
+
+    regex_rules = data.get("regex")
+    if isinstance(regex_rules, list):
+        for rule in regex_rules:
+            if not isinstance(rule, dict):
+                continue
+            pattern = rule.get("pattern")
+            repl = rule.get("replacement")
+            if not isinstance(pattern, str) or not pattern or not isinstance(repl, str):
+                continue
+            try:
+                text = re.sub(pattern, repl, text)
+            except re.error:
+                continue
+    return text
+
+
 def main() -> int:
     raw = sys.stdin.read()
     text = sanitize(raw)
+    if not text:
+        notify("Just Say", "No speech detected — nothing inserted.")
+        return 0
+    text = sanitize(apply_dictionary(text))
     if not text:
         notify("Just Say", "No speech detected — nothing inserted.")
         return 0

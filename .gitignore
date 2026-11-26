@@ -1,6 +1,7 @@
 # Never commit secrets, personal audio, transcripts, logs or reports.
 *.env
 server.env
+dictionary.json
 auth.json
 .codex/
 *.wav

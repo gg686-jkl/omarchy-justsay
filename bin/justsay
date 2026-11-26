@@ -42,7 +42,7 @@ vox_settings() {
   cat <<EOF
 whisper|mode|"remote"
 whisper|remote_endpoint|"http://127.0.0.1:$port"
-whisper|remote_timeout_secs|30
+whisper|remote_timeout_secs|60
 whisper|language|"auto"
 whisper|remote_send_auto_language|false
 output|fallback_to_clipboard|true

@@ -60,7 +60,7 @@ m=L('e','$EDIT').load_module(); json.loads(m.strip_jsonc(open('$T/e.jsonc').read
 
 echo "# justsay-postprocess"
 printf '#!/bin/sh\necho %s\n' "'{\"address\":\"0x1\",\"class\":\"test\"}'" >"$T/focus"; chmod +x "$T/focus"
-export JUSTSAY_NOTIFY_CMD=true JUSTSAY_CLIP_CMD="tee $T/clip" JUSTSAY_FOCUS_CMD="$T/focus"
+export JUSTSAY_NOTIFY_CMD=true JUSTSAY_CLIP_CMD="tee $T/clip" JUSTSAY_FOCUS_CMD="$T/focus" JUSTSAY_DICT_FILE=""
 pp() { printf '%b' "$1" | "$PP"; }
 check "plain text passes through" bash -c "[ \"\$(printf 'hello world' | '$PP')\" = 'hello world' ]"
 check "mixed zh/en preserved" bash -c "[ \"\$(printf '我刚刚 push 了一个 commit。' | '$PP')\" = '我刚刚 push 了一个 commit。' ]"
@@ -70,6 +70,24 @@ check "bidi overrides stripped" bash -c "out=\$(printf 'ab‮cd' | '$PP'); [ \"\
 check "empty/whitespace -> no output" bash -c "[ -z \"\$(printf ' \n\t ' | '$PP')\" ]"
 check "no focus -> clipboard, nothing typed" bash -c "out=\$(printf 'secret plan' | JUSTSAY_FOCUS_CMD='echo {}' '$PP'); [ -z \"\$out\" ] && [ \"\$(cat '$T/clip')\" = 'secret plan' ]"
 check "focus query failure -> clipboard" bash -c "out=\$(printf 'x' | JUSTSAY_FOCUS_CMD=false '$PP'); [ -z \"\$out\" ]"
+cat >"$T/dict.json" <<'D'
+{
+  "replacements": {
+    "vox": "WRONG_SHORT",
+    "vox type": "Voxtype",
+    "哦妈奇": "Omarchy",
+    "hyprland": "Hyprland"
+  }
+}
+D
+check "dict replaces mixed zh/en & respects longer phrase" bash -c "[ \"\$(printf '我在哦妈奇上用 vox type 和 hyprland' | JUSTSAY_DICT_FILE='$T/dict.json' '$PP')\" = '我在Omarchy上用 Voxtype 和 Hyprland' ]"
+check "dict respects ASCII word boundaries" bash -c "[ \"\$(printf 'myvoxtype voxing' | JUSTSAY_DICT_FILE='$T/dict.json' '$PP')\" = 'myvoxtype voxing' ]"
+printf '{bad json' >"$T/bad.json"
+check "dict invalid JSON fails open safely" bash -c "[ \"\$(printf 'keep text' | JUSTSAY_DICT_FILE='$T/bad.json' '$PP')\" = 'keep text' ]"
+cat >"$T/nl.json" <<'D'
+{"replacements": {"cmd": "rm -rf /\necho pwn"}}
+D
+check "dict output is re-sanitized (no newlines)" bash -c "out=\$(printf 'run cmd' | JUSTSAY_DICT_FILE='$T/nl.json' '$PP'); [[ \$out != *\$'\n'* && \$out = 'run rm -rf / echo pwn' ]]"
 
 echo "# adapter (mock voxtype)"
 mkdir -p "$T/mock"

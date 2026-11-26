@@ -94,6 +94,26 @@ The installer is idempotent: running it again repairs the setup and never duplic
 - A bridge crash, timeout, rate limit or upstream error means nothing is inserted and a notification explains why. systemd restarts a crashed bridge.
 - Audio stays in memory, and neither Just Say nor codex-asr stores audio or transcripts.
 
+### Custom dictionary (optional)
+
+For technical terms or Chinese/English mixed speech that ASR occasionally misspells, create `~/.config/justsay/dictionary.json` (changes apply immediately, no restart needed):
+
+```json
+{
+  "replacements": {
+    "vox type": "Voxtype",
+    "codex asr": "codex-asr",
+    "omarchy": "Omarchy"
+  }
+}
+```
+
+ASCII keys match case-insensitively on word boundaries; non-ASCII keys match substrings. Longer phrases run first, and output is re-sanitized so newlines or control characters are never inserted.
+
+### Improving laptop microphone quality (optional)
+
+Browsers and desktop chat apps run WebRTC high-pass filtering, noise suppression and automatic gain control on your microphone, while Voxtype captures raw PCM. If your laptop's internal mic has high noise floor or a wake-from-suspend pop, you can add a PipeWire WebRTC virtual source (`libpipewire-module-echo-cancel` with `library.name = "aec/libspa-aec-webrtc"` and `monitor.mode = true`) in `~/.config/pipewire/pipewire.conf.d/` and point **only** Voxtype at it by adding `PIPEWIRE_NODE=<your-source-name>` to `~/.config/justsay/server.env` and restarting `voxtype.service`.
+
 ## Freeing the local model (optional)
 
 Once cloud dictation works for you, the Whisper model Voxtype downloaded is unused:
