@@ -76,17 +76,39 @@ def default_dict_path() -> str:
     return os.path.join(cfg, "justsay", "dictionary.json")
 
 
+def convert_opencc(text: str, profile: str) -> str:
+    if not profile or not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
+        return text
+    cfg = f"{profile}.json"
+    try:
+        import opencc  # type: ignore
+        return opencc.OpenCC(cfg).convert(text)
+    except Exception:
+        pass
+    r = run(f"opencc -c {shlex.quote(cfg)}", data=text, timeout=2)
+    if r and r.returncode == 0 and r.stdout:
+        return r.stdout
+    return text
+
+
 def apply_dictionary(text: str) -> str:
     path = default_dict_path()
-    if not path or not os.path.isfile(path):
-        return text
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return text
-    if not isinstance(data, dict):
-        return text
+    data = {}
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}
+
+    opencc_profile = os.environ.get("JUSTSAY_OPENCC")
+    if opencc_profile is None:
+        raw_profile = data.get("opencc")
+        opencc_profile = raw_profile if isinstance(raw_profile, str) else ""
+    if opencc_profile:
+        text = convert_opencc(text, opencc_profile.strip())
 
     replacements = data.get("replacements")
     if isinstance(replacements, dict):

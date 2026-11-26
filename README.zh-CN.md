@@ -102,6 +102,7 @@ git clone https://github.com/gg686-jkl/omarchy-justsay.git && cd omarchy-justsay
 
 ```json
 {
+  "opencc": "t2s",
   "replacements": {
     "vox type": "Voxtype",
     "codex asr": "codex-asr",
@@ -110,7 +111,7 @@ git clone https://github.com/gg686-jkl/omarchy-justsay.git && cd omarchy-justsay
 }
 ```
 
-纯 ASCII 词条按英文词边界不区分大小写匹配；含中文/非 ASCII 词条按子串匹配。长词组优先于短词执行，替换结果会再次经过安全清洗，确保绝不引入换行或控制字符。
+设置 `"opencc": "t2s"`（需本机安装 OpenCC，例如 Arch 的 `opencc` 包）即可在离线毫秒级内将云端偶尔吐出的繁体中文强制转为简体中文，同时保持英文原样不动；不需要时省略该字段即可。纯 ASCII 词条按英文词边界不区分大小写匹配；含中文/非 ASCII 词条按子串匹配。长词组优先于短词执行，替换结果会再次经过安全清洗，确保绝不引入换行或控制字符。
 
 ### 优化笔记本内置麦克风音质（可选）
 

@@ -102,6 +102,7 @@ For technical terms or Chinese/English mixed speech that ASR occasionally misspe
 
 ```json
 {
+  "opencc": "t2s",
   "replacements": {
     "vox type": "Voxtype",
     "codex asr": "codex-asr",
@@ -110,7 +111,7 @@ For technical terms or Chinese/English mixed speech that ASR occasionally misspe
 }
 ```
 
-ASCII keys match case-insensitively on word boundaries; non-ASCII keys match substrings. Longer phrases run first, and output is re-sanitized so newlines or control characters are never inserted.
+Set `"opencc": "t2s"` (requires [OpenCC](https://github.com/BYVoid/OpenCC), e.g. `opencc` on Arch) to force Traditional Chinese output into Simplified Chinese while leaving English untouched; omit it if you don't need script conversion. ASCII keys match case-insensitively on word boundaries; non-ASCII keys match substrings. Longer phrases run first, and output is re-sanitized so newlines or control characters are never inserted.
 
 ### Improving laptop microphone quality (optional)
 

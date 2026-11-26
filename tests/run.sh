@@ -88,6 +88,16 @@ cat >"$T/nl.json" <<'D'
 {"replacements": {"cmd": "rm -rf /\necho pwn"}}
 D
 check "dict output is re-sanitized (no newlines)" bash -c "out=\$(printf 'run cmd' | JUSTSAY_DICT_FILE='$T/nl.json' '$PP'); [[ \$out != *\$'\n'* && \$out = 'run rm -rf / echo pwn' ]]"
+cat >"$T/badocc.json" <<'D'
+{"opencc": "../bad"}
+D
+check "dict invalid opencc profile fails open safely" bash -c "[ \"\$(printf 'keep 語音' | JUSTSAY_DICT_FILE='$T/badocc.json' '$PP')\" = 'keep 語音' ]"
+if command -v opencc >/dev/null 2>&1 || python3 -I -c 'import opencc' 2>/dev/null; then
+  cat >"$T/occ.json" <<'D'
+{"opencc": "t2s", "replacements": {"哦妈奇": "Omarchy", "vox type": "Voxtype"}}
+D
+  check "opencc t2s converts Traditional to Simplified before dict & preserves English" bash -c "[ \"\$(printf '我剛剛在哦媽奇上用 vox type push 了一個 commit' | JUSTSAY_DICT_FILE='$T/occ.json' '$PP')\" = '我刚刚在Omarchy上用 Voxtype push 了一个 commit' ]"
+fi
 
 echo "# adapter (mock voxtype)"
 mkdir -p "$T/mock"
