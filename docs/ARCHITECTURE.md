@@ -8,8 +8,8 @@
 | `justsay` | `~/.local/bin` (symlink) | CLI: install, activate, deactivate, health, preflight, doctor, watch, cleanup, rollback, uninstall. |
 | `justsay-asr.service` | `~/.config/systemd/user` | Runs `codex-asr serve` on 127.0.0.1 only, with a local bearer key read from an env file (never on the command line) and systemd hardening. |
 | `justsay-watch.service` | `~/.config/systemd/user` | Follows Voxtype's journal for `Transcription failed` and maps each one to a notification. It keeps the last error in `$XDG_RUNTIME_DIR`, which is never persisted. |
-| `voxtype.service.d/justsay.conf` | drop-in | Hands Voxtype `VOXTYPE_WHISPER_API_KEY`, sets `RUST_LOG=warn` so transcripts never reach the journal, and pulls in the two services above. |
-| `justsay-postprocess` | Voxtype `[output.post_process]` | Reads the transcript on stdin and writes the sanitized single-line text to stdout. With no focused window it uses the clipboard, prints nothing and sends a notification. |
+| `voxtype.service.d/justsay.conf` | drop-in | Loads `~/.config/justsay/server.env` (handing Voxtype `VOXTYPE_WHISPER_API_KEY` and any optional overrides such as `PIPEWIRE_NODE`), sets `RUST_LOG=warn` so transcripts never reach the journal, and pulls in the two services above. |
+| `justsay-postprocess` | Voxtype `[output.post_process]` | Reads the transcript on stdin, applies optional `~/.config/justsay/dictionary.json` replacements, re-sanitizes to a single line, and writes to stdout. With no focused window it uses the clipboard, prints nothing and sends a notification. |
 | `Widget.qml` + `manifest.json` | Omarchy shell plugin `justsay` | Bar icon. It watches Voxtype's state file (inotify) and polls `justsay health --json`. |
 | menu rows | `~/.config/omarchy/extensions/omarchy-menu.jsonc`, between markers | *Setup › Defaults › Dictation › Just Say (cloud)*, *Remove › Dictation › Just Say*. They also override the Voxtype row so that picking Voxtype restores local settings first. |
 

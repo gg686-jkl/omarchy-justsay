@@ -1,5 +1,7 @@
 # Just Say
 
+**English** · [中文](README.zh-CN.md)
+
 **Cloud dictation for [Omarchy](https://omarchy.org).** Press **Alt+Space** and speak. Your words appear at the cursor, transcribed in the cloud with the ChatGPT/Codex login you already have. Chinese, English and mixed speech (`我刚刚 push 了一个 commit`) all work. You don't need a local model, a GPU or an API key.
 
 Just Say plugs into the parts of Omarchy that already exist:
@@ -13,7 +15,7 @@ Alt+Space ─▶ omarchy-dictation ─▶ omarchy-dictation-justsay (preflight, 
           ─▶ Voxtype (records; whisper mode = remote)
           ─▶ http://127.0.0.1:8788  codex-asr bridge (user systemd, loopback + local key)
           ─▶ chatgpt.com/backend-api/transcribe   (unofficial, uses your Codex login)
-          ─▶ justsay-postprocess (strips newlines/control chars; clipboard if no focus)
+          ─▶ justsay-postprocess (sanitizes, optional dictionary; clipboard if no focus)
           ─▶ typed once into the focused window. Enter is never pressed.
 ```
 
@@ -72,7 +74,7 @@ The installer is idempotent: running it again repairs the setup and never duplic
 1. Backs up `~/.config/voxtype/config.toml`, the Omarchy menu extension file and the dictation default to `~/.local/state/justsay/backups/`.
 2. Downloads codex-asr v0.1.2 from its GitHub release (sha256-pinned) into `~/.local/share/justsay/bin/`.
 3. Creates `justsay-asr.service`, which listens on 127.0.0.1 only and needs a random local key stored in `~/.config/justsay/server.env` (mode 0600). It also creates `justsay-watch.service`, which turns transcription errors into notifications.
-4. Changes only these Voxtype keys: `whisper.mode = "remote"`, `remote_endpoint`, `language = "auto"`, `remote_timeout_secs`, `auto_submit = false`, `fallback_to_clipboard = true`, plus an `[output.post_process]` filter. It also adds a drop-in that hands Voxtype the key and keeps transcripts out of the journal.
+4. Changes only these Voxtype keys: `whisper.mode = "remote"`, `remote_endpoint`, `language = "auto"`, `remote_send_auto_language = false`, `remote_timeout_secs = 60`, `auto_submit = false`, `text.smart_auto_submit = false`, `fallback_to_clipboard = true`, plus an `[output.post_process]` filter. It also adds a drop-in that hands Voxtype the key and keeps transcripts out of the journal.
 5. Adds the menu entries and selects `justsay` as Omarchy's dictation backend.
 
 ## Use
@@ -112,7 +114,37 @@ ASCII keys match case-insensitively on word boundaries; non-ASCII keys match sub
 
 ### Improving laptop microphone quality (optional)
 
-Browsers and desktop chat apps run WebRTC high-pass filtering, noise suppression and automatic gain control on your microphone, while Voxtype captures raw PCM. If your laptop's internal mic has high noise floor or a wake-from-suspend pop, you can add a PipeWire WebRTC virtual source (`libpipewire-module-echo-cancel` with `library.name = "aec/libspa-aec-webrtc"` and `monitor.mode = true`) in `~/.config/pipewire/pipewire.conf.d/` and point **only** Voxtype at it by adding `PIPEWIRE_NODE=<your-source-name>` to `~/.config/justsay/server.env` and restarting `voxtype.service`.
+Browsers and desktop chat apps run WebRTC high-pass filtering, noise suppression and automatic gain control on your microphone, while Voxtype captures raw PCM. If your laptop's internal mic has a high noise floor or a wake-from-suspend DC pop, add a dedicated PipeWire WebRTC virtual source (for example `~/.config/pipewire/pipewire.conf.d/60-justsay-webrtc-mic.conf`):
+
+```hocon
+context.modules = [
+  {
+    name = libpipewire-module-echo-cancel
+    args = {
+      library.name = "aec/libspa-aec-webrtc"
+      monitor.mode = true
+      audio.rate = 48000
+      audio.channels = 1
+      audio.position = [ MONO ]
+      aec.args = {
+        webrtc.high_pass_filter = true
+        webrtc.noise_suppression = true
+        webrtc.gain_control = true
+      }
+      capture.props = { node.name = "justsay-mic-capture", node.passive = true }
+      source.props  = { node.name = "justsay-mic-clean", priority.session = 100 }
+    }
+  }
+]
+```
+
+Then route **only** Voxtype to that source (avoiding double WebRTC processing in browsers or chat apps) by appending `PIPEWIRE_NODE=justsay-mic-clean` to `~/.config/justsay/server.env` and restarting PipeWire and Voxtype:
+
+```bash
+systemctl --user restart pipewire pipewire-pulse wireplumber voxtype.service
+```
+
+For longer dictation, you can also raise `[audio] max_duration_secs` (default `60`, e.g. `300`) in `~/.config/voxtype/config.toml` and restart `voxtype.service`.
 
 ## Freeing the local model (optional)
 
@@ -129,7 +161,7 @@ The command refuses to run unless cloud mode is active and healthy. It touches n
 
 - **Back to local Voxtype:** *Setup › Defaults › Dictation › Voxtype*, or `justsay switch-to-voxtype`. This restores exactly the Voxtype keys Just Say changed.
 - **Rollback:** `justsay rollback` restores the backed-up files byte-for-byte.
-- **Uninstall:** *Remove › Dictation › Just Say*, or `justsay uninstall`. This removes the services, drop-in, key file, menu entries and commands, and makes Voxtype the default backend again. Backups and reports stay in `~/.local/state/justsay/`.
+- **Uninstall:** *Remove › Dictation › Just Say*, or `justsay uninstall`. This removes the services, drop-in, key file, menu entries and commands, and makes Voxtype the default backend again. Backups, reports in `~/.local/state/justsay/`, and your optional `dictionary.json` stay untouched.
 
 ## Troubleshooting
 
